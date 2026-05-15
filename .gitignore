@@ -18,6 +18,8 @@ env/
 .idea/
 
 # Local documents and extracted outputs
+*.pdf
+benchmark.log
 outputs/
 output/
 results/

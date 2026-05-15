@@ -2,17 +2,28 @@
 numpy
 pillow
 pymupdf
+pdfplumber
+pdf2image
 pypdf
 pypdfium2
+streamlit
 
 # Backend 1: Unstructured PDF parsing
 unstructured[pdf]
 
 # Optional OCR / document AI backends.
 # Install these one by one when you are ready to compare them:
-# rapidocr
-# onnxruntime
-# paddleocr
-# paddlepaddle
+rapidocr-onnxruntime
+paddleocr
+paddlepaddle
 # surya-ocr
 docling
+transformers
+timm
+einops
+torch
+pytesseract
+
+# Florence-2 may also require flash_attn depending on the downloaded model code.
+# It can be difficult to install on CPU-only machines, so install it separately:
+# pip install flash-attn --no-build-isolation

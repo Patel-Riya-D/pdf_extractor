@@ -6,6 +6,8 @@ Run: streamlit run app.py
 import streamlit as st
 import time, os, io, logging
 from pathlib import Path
+from importlib.util import find_spec
+from shutil import which
 
 # ── Logger setup ──────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -16,8 +18,84 @@ logging.basicConfig(
 )
 log = logging.getLogger("pdf_bench")
 
+
+class MissingDependencyError(RuntimeError):
+    pass
+
 os.environ["FLAGS_use_mkldnn"]      = "0"
 os.environ["PADDLE_DISABLE_MKLDNN"] = "1"
+
+
+LIBRARY_REQUIREMENTS = {
+    "pymupdf": {
+        "python": [("fitz", "pymupdf")],
+    },
+    "pdfplumber": {
+        "python": [("pdfplumber", "pdfplumber")],
+    },
+    "paddleocr": {
+        "python": [
+            ("numpy", "numpy"),
+            ("pdf2image", "pdf2image"),
+            ("paddleocr", "paddleocr"),
+            ("paddle", "paddlepaddle"),
+        ],
+        "system": [("pdftoppm", "poppler-utils")],
+    },
+    "rapidocr": {
+        "python": [
+            ("numpy", "numpy"),
+            ("pdf2image", "pdf2image"),
+            ("rapidocr_onnxruntime", "rapidocr-onnxruntime"),
+        ],
+        "system": [("pdftoppm", "poppler-utils")],
+    },
+    "unstructured": {
+        "python": [("unstructured.partition.pdf", "unstructured[pdf]")],
+    },
+    "docling": {
+        "python": [("docling.document_converter", "docling")],
+    },
+    "florence2": {
+        "python": [
+            ("torch", "torch"),
+            ("transformers", "transformers"),
+            ("timm", "timm"),
+            ("einops", "einops"),
+            ("pdf2image", "pdf2image"),
+            ("flash_attn", "flash_attn"),
+        ],
+        "system": [("pdftoppm", "poppler-utils")],
+    },
+}
+
+
+def check_library_ready(library, image_ocr=False):
+    reqs = LIBRARY_REQUIREMENTS.get(library, {})
+    missing_py = [
+        package for module, package in reqs.get("python", [])
+        if find_spec(module) is None
+    ]
+    missing_sys = [
+        package for command, package in reqs.get("system", [])
+        if which(command) is None
+    ]
+
+    if image_ocr and library in ("pymupdf", "pdfplumber", "docling"):
+        if find_spec("pytesseract") is None:
+            missing_py.append("pytesseract")
+        if which("tesseract") is None:
+            missing_sys.append("tesseract-ocr")
+
+    if missing_py or missing_sys:
+        parts = []
+        if missing_py:
+            parts.append("Python: pip install " + " ".join(dict.fromkeys(missing_py)))
+        if missing_sys:
+            parts.append("System: sudo apt install " + " ".join(dict.fromkeys(missing_sys)))
+        if library == "florence2" and "flash_attn" in missing_py:
+            parts.append("Tip: Florence-2 needs flash_attn in this environment; use paddleocr or rapidocr for CPU OCR.")
+        raise MissingDependencyError("Missing dependencies for " + library + ". " + " | ".join(parts))
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="PDF Extraction Benchmark", layout="wide", page_icon="📄")
@@ -44,6 +122,10 @@ pip install unstructured[pdf]
 pip install docling
 pip install transformers timm einops
 pip install streamlit pdf2image
+sudo apt install poppler-utils tesseract-ocr
+
+# Florence-2 only if your machine supports it:
+pip install flash-attn --no-build-isolation
 ```
 """)
 
@@ -144,8 +226,13 @@ def run_docling(path):
 
 def run_florence2(path):
     import torch
-    from transformers import AutoProcessor, AutoModelForCausalLM
+    import transformers
+    from transformers import AutoModelForCausalLM, AutoModelForVision2Seq, AutoProcessor
     from pdf2image import convert_from_path
+
+    if not hasattr(transformers, "AutoModelForImageTextToText"):
+        transformers.AutoModelForImageTextToText = AutoModelForVision2Seq
+
     MODEL_ID = "microsoft/Florence-2-large"
     device   = "cuda" if torch.cuda.is_available() else "cpu"
     dtype    = torch.float16 if device == "cuda" else torch.float32
@@ -197,7 +284,12 @@ def ocr_images_with(library, images):
 
     elif library == "florence2":
         import torch
-        from transformers import AutoProcessor, AutoModelForCausalLM
+        import transformers
+        from transformers import AutoModelForCausalLM, AutoModelForVision2Seq, AutoProcessor
+
+        if not hasattr(transformers, "AutoModelForImageTextToText"):
+            transformers.AutoModelForImageTextToText = AutoModelForVision2Seq
+
         MODEL_ID = "microsoft/Florence-2-large"
         device   = "cuda" if torch.cuda.is_available() else "cpu"
         dtype    = torch.float16 if device == "cuda" else torch.float32
@@ -221,9 +313,18 @@ def ocr_images_with(library, images):
     else:
         try:
             import pytesseract
+            from pytesseract import TesseractNotFoundError
             for i, img in enumerate(images, 1):
-                text += pytesseract.image_to_string(img) + "\n"
-                log.info(f"Image OCR pytesseract: image {i}/{len(images)} done")
+                try:
+                    text += pytesseract.image_to_string(img) + "\n"
+                    log.info(f"Image OCR pytesseract: image {i}/{len(images)} done")
+                except TesseractNotFoundError:
+                    text = (
+                        "Tesseract OCR is not installed or not in PATH. "
+                        "On Ubuntu/Linux run: sudo apt install tesseract-ocr"
+                    )
+                    log.error(text)
+                    break
         except ImportError:
             text = "pytesseract not installed. Run: pip install pytesseract"
 
@@ -262,6 +363,7 @@ if st.button("▶ Run Benchmark", type="primary", use_container_width=True):
     with status:
         t0 = time.perf_counter()
         try:
+            check_library_ready(library)
             pdf_text, n_imgs = runners[library](str(tmp_path))
             elapsed = time.perf_counter() - t0
             status.update(label=f"✅ Done in {elapsed:.2f}s", state="complete")
@@ -311,6 +413,7 @@ if st.button("▶ Run Benchmark", type="primary", use_container_width=True):
             with img_status:
                 t1 = time.perf_counter()
                 try:
+                    check_library_ready(library, image_ocr=True)
                     img_text  = ocr_images_with(library, embedded_imgs)
                     img_elapsed = time.perf_counter() - t1
                     img_status.update(label=f"✅ Done in {img_elapsed:.2f}s", state="complete")

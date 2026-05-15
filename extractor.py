@@ -22,6 +22,8 @@ OCR-FROM-IMAGE TEST:
 """
 
 import time, os
+from importlib.util import find_spec
+from shutil import which
 import fitz   # pymupdf - used for page count + image extraction
 
 PDF_PATH         = "/home/riyap/pdf_extractor/uploads/4th_sample-report_english_final.pdf"  # <-- your PDF
@@ -30,6 +32,82 @@ TEST_OCR_ON_IMAGE = True          # <-- True = also OCR the embedded images
 
 os.environ["FLAGS_use_mkldnn"]      = "0"
 os.environ["PADDLE_DISABLE_MKLDNN"] = "1"
+
+
+class MissingDependencyError(RuntimeError):
+    pass
+
+
+LIBRARY_REQUIREMENTS = {
+    "pymupdf": {
+        "python": [("fitz", "pymupdf")],
+    },
+    "pdfplumber": {
+        "python": [("pdfplumber", "pdfplumber")],
+    },
+    "paddleocr": {
+        "python": [
+            ("numpy", "numpy"),
+            ("pdf2image", "pdf2image"),
+            ("paddleocr", "paddleocr"),
+            ("paddle", "paddlepaddle"),
+        ],
+        "system": [("pdftoppm", "poppler-utils")],
+    },
+    "rapidocr": {
+        "python": [
+            ("numpy", "numpy"),
+            ("pdf2image", "pdf2image"),
+            ("rapidocr_onnxruntime", "rapidocr-onnxruntime"),
+        ],
+        "system": [("pdftoppm", "poppler-utils")],
+    },
+    "unstructured": {
+        "python": [("unstructured.partition.pdf", "unstructured[pdf]")],
+    },
+    "docling": {
+        "python": [("docling.document_converter", "docling")],
+    },
+    "florence2": {
+        "python": [
+            ("torch", "torch"),
+            ("transformers", "transformers"),
+            ("timm", "timm"),
+            ("einops", "einops"),
+            ("pdf2image", "pdf2image"),
+            ("flash_attn", "flash_attn"),
+        ],
+        "system": [("pdftoppm", "poppler-utils")],
+    },
+}
+
+
+def check_library_ready(library, image_ocr=False):
+    reqs = LIBRARY_REQUIREMENTS.get(library, {})
+    missing_py = [
+        package for module, package in reqs.get("python", [])
+        if find_spec(module) is None
+    ]
+    missing_sys = [
+        package for command, package in reqs.get("system", [])
+        if which(command) is None
+    ]
+
+    if image_ocr and library in ("pymupdf", "pdfplumber", "docling"):
+        if find_spec("pytesseract") is None:
+            missing_py.append("pytesseract")
+        if which("tesseract") is None:
+            missing_sys.append("tesseract-ocr")
+
+    if missing_py or missing_sys:
+        parts = []
+        if missing_py:
+            parts.append("Python: pip install " + " ".join(dict.fromkeys(missing_py)))
+        if missing_sys:
+            parts.append("System: sudo apt install " + " ".join(dict.fromkeys(missing_sys)))
+        if library == "florence2" and "flash_attn" in missing_py:
+            parts.append("Tip: Florence-2 needs flash_attn in this environment; use paddleocr or rapidocr for CPU OCR.")
+        raise MissingDependencyError("Missing dependencies for " + library + ". " + " | ".join(parts))
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -130,8 +208,12 @@ def run_docling(path):
 
 def run_florence2(path):
     import torch
-    from transformers import AutoProcessor, AutoModelForCausalLM
+    import transformers
+    from transformers import AutoModelForCausalLM, AutoModelForVision2Seq, AutoProcessor
     from pdf2image import convert_from_path
+
+    if not hasattr(transformers, "AutoModelForImageTextToText"):
+        transformers.AutoModelForImageTextToText = AutoModelForVision2Seq
 
     MODEL_ID  = "microsoft/Florence-2-large"
     device    = "cuda" if torch.cuda.is_available() else "cpu"
@@ -198,7 +280,12 @@ def ocr_images_with(library, images):
 
     elif library == "florence2":
         import torch
-        from transformers import AutoProcessor, AutoModelForCausalLM
+        import transformers
+        from transformers import AutoModelForCausalLM, AutoModelForVision2Seq, AutoProcessor
+
+        if not hasattr(transformers, "AutoModelForImageTextToText"):
+            transformers.AutoModelForImageTextToText = AutoModelForVision2Seq
+
         MODEL_ID  = "microsoft/Florence-2-large"
         device    = "cuda" if torch.cuda.is_available() else "cpu"
         dtype     = torch.float16 if device == "cuda" else torch.float32
@@ -219,8 +306,16 @@ def ocr_images_with(library, images):
         # these don't have an OCR engine; use pytesseract as fallback
         try:
             import pytesseract
+            from pytesseract import TesseractNotFoundError
             for img in images:
-                text += pytesseract.image_to_string(img) + "\n"
+                try:
+                    text += pytesseract.image_to_string(img) + "\n"
+                except TesseractNotFoundError:
+                    text = (
+                        "[Tesseract OCR is not installed or not in PATH. "
+                        "On Ubuntu/Linux run: sudo apt install tesseract-ocr]"
+                    )
+                    break
         except ImportError:
             text = "[pytesseract not installed — pip install pytesseract]"
 
@@ -252,15 +347,20 @@ else:
     print("-" * 45)
 
     # --- Part 1: extract text from PDF pages ---
-    t0           = time.perf_counter()
-    text, n_imgs = runners[LIBRARY](PDF_PATH)
-    elapsed      = time.perf_counter() - t0
+    try:
+        check_library_ready(LIBRARY)
+        t0           = time.perf_counter()
+        text, n_imgs = runners[LIBRARY](PDF_PATH)
+        elapsed      = time.perf_counter() - t0
 
-    print(f"[PDF]  Time         : {elapsed:.2f}s")
-    print(f"[PDF]  Chars extract: {len(text)}")
-    print(f"[PDF]  Images found : {n_imgs}")
-    print(f"\n--- Text preview (first 500 chars) ---")
-    print(text[:500])
+        print(f"[PDF]  Time         : {elapsed:.2f}s")
+        print(f"[PDF]  Chars extract: {len(text)}")
+        print(f"[PDF]  Images found : {n_imgs}")
+        print(f"\n--- Text preview (first 500 chars) ---")
+        print(text[:500])
+    except MissingDependencyError as e:
+        print(f"[PDF]  Error        : {e}")
+        raise SystemExit(1)
 
     # --- Part 2: OCR on embedded images ---
     if TEST_OCR_ON_IMAGE:
@@ -268,12 +368,16 @@ else:
         embedded = get_embedded_images(PDF_PATH)
         print(f"Embedded images in PDF: {len(embedded)}")
         if embedded:
-            t1       = time.perf_counter()
-            img_text = ocr_images_with(LIBRARY, embedded)
-            img_t    = time.perf_counter() - t1
-            print(f"[IMG]  Time         : {img_t:.2f}s")
-            print(f"[IMG]  Chars extract: {len(img_text)}")
-            print(f"\n--- Image OCR preview (first 300 chars) ---")
-            print(img_text[:300])
+            try:
+                check_library_ready(LIBRARY, image_ocr=True)
+                t1       = time.perf_counter()
+                img_text = ocr_images_with(LIBRARY, embedded)
+                img_t    = time.perf_counter() - t1
+                print(f"[IMG]  Time         : {img_t:.2f}s")
+                print(f"[IMG]  Chars extract: {len(img_text)}")
+                print(f"\n--- Image OCR preview (first 300 chars) ---")
+                print(img_text[:300])
+            except MissingDependencyError as e:
+                print(f"[IMG]  Error        : {e}")
         else:
             print("No embedded images found in this PDF.")
