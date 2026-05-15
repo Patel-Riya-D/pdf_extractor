@@ -24,7 +24,7 @@ OCR-FROM-IMAGE TEST:
 import time, os
 import fitz   # pymupdf - used for page count + image extraction
 
-PDF_PATH         = "4th_sample-report_english_final.pdf"  # <-- your PDF
+PDF_PATH         = "/home/riyap/pdf_extractor/uploads/4th_sample-report_english_final.pdf"  # <-- your PDF
 LIBRARY          = "florence2"    # <-- CHANGE THIS to switch library
 TEST_OCR_ON_IMAGE = True          # <-- True = also OCR the embedded images
 
