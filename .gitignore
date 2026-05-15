@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.python-version
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment and local config
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+
+# Local documents and extracted outputs
+*.pdf
+outputs/
+output/
+results/
+
+# Model/cache artifacts
+.cache/
+models/
+*.onnx
+*.pt
+*.pth
+*.safetensors
+
+# OS files
+.DS_Store
+Thumbs.db

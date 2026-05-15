@@ -1,0 +1,18 @@
+# Base utilities used by extractor.py
+numpy
+pillow
+pymupdf
+pypdf
+pypdfium2
+
+# Backend 1: Unstructured PDF parsing
+unstructured[pdf]
+
+# Optional OCR / document AI backends.
+# Install these one by one when you are ready to compare them:
+# rapidocr
+# onnxruntime
+# paddleocr
+# paddlepaddle
+# surya-ocr
+docling
