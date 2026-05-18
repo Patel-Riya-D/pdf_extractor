@@ -21,8 +21,9 @@ OCR-FROM-IMAGE TEST:
     embedded inside the PDF (true OCR challenge).
 """
 
-import time, os
+import time, os, io, logging
 from importlib.util import find_spec
+from contextlib import redirect_stdout, redirect_stderr
 from shutil import which
 import fitz   # pymupdf - used for page count + image extraction
 
@@ -30,6 +31,7 @@ PDF_PATH         = "/home/riyap/pdf_extractor/uploads/4th_sample-report_english_
 LIBRARY          = "paddleocr"    # <-- CHANGE THIS to switch library
 TEST_OCR_ON_IMAGE = True          # <-- True = also OCR the embedded images
 
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 os.environ["FLAGS_use_mkldnn"]      = "0"
 os.environ["PADDLE_DISABLE_MKLDNN"] = "1"
 
@@ -75,7 +77,6 @@ LIBRARY_REQUIREMENTS = {
             ("timm", "timm"),
             ("einops", "einops"),
             ("pdf2image", "pdf2image"),
-            ("flash_attn", "flash_attn"),
         ],
         "system": [("pdftoppm", "poppler-utils")],
     },
@@ -105,9 +106,27 @@ def check_library_ready(library, image_ocr=False):
             parts.append("Python: pip install " + " ".join(dict.fromkeys(missing_py)))
         if missing_sys:
             parts.append("System: sudo apt install " + " ".join(dict.fromkeys(missing_sys)))
-        if library == "florence2" and "flash_attn" in missing_py:
-            parts.append("Tip: Florence-2 needs flash_attn in this environment; use paddleocr or rapidocr for CPU OCR.")
         raise MissingDependencyError("Missing dependencies for " + library + ". " + " | ".join(parts))
+
+
+def florence_model_kwargs(dtype):
+    kwargs = {"torch_dtype": dtype, "trust_remote_code": True}
+    if find_spec("flash_attn") is None:
+        kwargs["attn_implementation"] = "eager"
+    return kwargs
+
+
+def format_florence_error(exc):
+    msg = str(exc)
+    if "flash_attn" in msg or "flash-attn" in msg or "flash attention" in msg.lower():
+        return (
+            msg
+            + " | Tip: flash_attn is optional but may be required by some Florence-2/"
+            + "transformers combinations. Try upgrading transformers or install with: "
+            + "pip install flash-attn --no-build-isolation. For CPU OCR, paddleocr or "
+            + "rapidocr are usually easier."
+        )
+    return msg
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -124,6 +143,22 @@ def get_embedded_images(path):
             raw  = doc.extract_image(xref)
             imgs.append(Image.open(io.BytesIO(raw["image"])).convert("RGB"))
     return imgs
+
+
+def load_paddleocr_model():
+    from paddleocr import PaddleOCR
+    for logger_name in ("paddle", "paddleocr", "paddlex", "ppocr"):
+        logging.getLogger(logger_name).setLevel(logging.ERROR)
+    kwargs = {
+        "use_doc_orientation_classify": False,
+        "use_doc_unwarping": False,
+        "use_textline_orientation": False,
+        "enable_mkldnn": False,
+        "lang": "en",
+        "device": "cpu",
+    }
+    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+        return PaddleOCR(**kwargs)
 
 
 # ── runners ───────────────────────────────────────────────────────────────────
@@ -152,8 +187,7 @@ def run_pdfplumber(path):
 def run_paddleocr(path):
     import numpy as np
     from pdf2image import convert_from_path
-    from paddleocr import PaddleOCR
-    ocr   = PaddleOCR(use_textline_orientation=True, lang="en", device="cpu")
+    ocr   = load_paddleocr_model()
     pages = convert_from_path(path, dpi=200)
     text  = ""
     for page in pages:
@@ -220,9 +254,12 @@ def run_florence2(path):
     dtype     = torch.float16 if device == "cuda" else torch.float32
 
     print(f"  Loading Florence-2 on {device} ...")
-    processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
-    model     = AutoModelForCausalLM.from_pretrained(
-                    MODEL_ID, torch_dtype=dtype, trust_remote_code=True).to(device)
+    try:
+        processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
+        model     = AutoModelForCausalLM.from_pretrained(
+                        MODEL_ID, **florence_model_kwargs(dtype)).to(device)
+    except Exception as e:
+        raise RuntimeError(format_florence_error(e)) from e
 
     pages  = convert_from_path(path, dpi=150)
     text   = ""
@@ -255,8 +292,7 @@ def ocr_images_with(library, images):
 
     if library == "paddleocr":
         import numpy as np
-        from paddleocr import PaddleOCR
-        ocr = PaddleOCR(use_textline_orientation=True, lang="en", device="cpu")
+        ocr = load_paddleocr_model()
         for img in images:
             result = list(ocr.predict(np.array(img)))
             if result:
@@ -289,9 +325,12 @@ def ocr_images_with(library, images):
         MODEL_ID  = "microsoft/Florence-2-large"
         device    = "cuda" if torch.cuda.is_available() else "cpu"
         dtype     = torch.float16 if device == "cuda" else torch.float32
-        processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
-        model     = AutoModelForCausalLM.from_pretrained(
-                        MODEL_ID, torch_dtype=dtype, trust_remote_code=True).to(device)
+        try:
+            processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
+            model     = AutoModelForCausalLM.from_pretrained(
+                            MODEL_ID, **florence_model_kwargs(dtype)).to(device)
+        except Exception as e:
+            raise RuntimeError(format_florence_error(e)) from e
         prompt = "<OCR>"
         for img in images:
             inputs = processor(text=prompt, images=img, return_tensors="pt").to(device, dtype)

@@ -7,6 +7,7 @@ import streamlit as st
 import time, os, io, logging
 from pathlib import Path
 from importlib.util import find_spec
+from contextlib import redirect_stdout, redirect_stderr
 from shutil import which
 
 # ── Logger setup ──────────────────────────────────────────────────────────────
@@ -22,6 +23,7 @@ log = logging.getLogger("pdf_bench")
 class MissingDependencyError(RuntimeError):
     pass
 
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 os.environ["FLAGS_use_mkldnn"]      = "0"
 os.environ["PADDLE_DISABLE_MKLDNN"] = "1"
 
@@ -63,7 +65,14 @@ LIBRARY_REQUIREMENTS = {
             ("timm", "timm"),
             ("einops", "einops"),
             ("pdf2image", "pdf2image"),
-            ("flash_attn", "flash_attn"),
+        ],
+        "system": [("pdftoppm", "poppler-utils")],
+    },
+    "surya": {
+        "python": [
+            ("torch", "torch"),
+            ("surya", "surya-ocr"),
+            ("pdf2image", "pdf2image"),
         ],
         "system": [("pdftoppm", "poppler-utils")],
     },
@@ -93,9 +102,27 @@ def check_library_ready(library, image_ocr=False):
             parts.append("Python: pip install " + " ".join(dict.fromkeys(missing_py)))
         if missing_sys:
             parts.append("System: sudo apt install " + " ".join(dict.fromkeys(missing_sys)))
-        if library == "florence2" and "flash_attn" in missing_py:
-            parts.append("Tip: Florence-2 needs flash_attn in this environment; use paddleocr or rapidocr for CPU OCR.")
         raise MissingDependencyError("Missing dependencies for " + library + ". " + " | ".join(parts))
+
+
+def florence_model_kwargs(dtype):
+    kwargs = {"torch_dtype": dtype, "trust_remote_code": True}
+    if find_spec("flash_attn") is None:
+        kwargs["attn_implementation"] = "eager"
+    return kwargs
+
+
+def format_florence_error(exc):
+    msg = str(exc)
+    if "flash_attn" in msg or "flash-attn" in msg or "flash attention" in msg.lower():
+        return (
+            msg
+            + " | Tip: flash_attn is optional but may be required by some Florence-2/"
+            + "transformers combinations. Try upgrading transformers or install with: "
+            + "pip install flash-attn --no-build-isolation. For CPU OCR, paddleocr or "
+            + "rapidocr are usually easier."
+        )
+    return msg
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="PDF Extraction Benchmark", layout="wide", page_icon="📄")
@@ -108,7 +135,7 @@ with st.sidebar:
     uploaded = st.file_uploader("Upload PDF", type=["pdf"])
     library  = st.selectbox("Library", [
         "pymupdf", "pdfplumber", "paddleocr",
-        "rapidocr", "unstructured", "docling", "florence2"
+        "rapidocr", "surya", "unstructured", "docling", "florence2"
     ])
     run_img_ocr = st.toggle("OCR on embedded images", value=True)
     st.divider()
@@ -118,6 +145,7 @@ with st.sidebar:
 pip install pymupdf pdfplumber
 pip install paddlepaddle paddleocr
 pip install rapidocr-onnxruntime
+pip install surya-ocr
 pip install unstructured[pdf]
 pip install docling
 pip install transformers timm einops
@@ -146,6 +174,48 @@ def get_embedded_images(path):
     log.info(f"Extracted {len(imgs)} embedded images from PDF")
     return imgs
 
+def load_paddleocr_model():
+    from paddleocr import PaddleOCR
+    for logger_name in ("paddle", "paddleocr", "paddlex", "ppocr"):
+        logging.getLogger(logger_name).setLevel(logging.ERROR)
+    kwargs = {
+        "use_doc_orientation_classify": False,
+        "use_doc_unwarping": False,
+        "use_textline_orientation": False,
+        "enable_mkldnn": False,
+        "lang": "en",
+        "device": "cpu",
+    }
+    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+        return PaddleOCR(**kwargs)
+
+def load_surya_models():
+    from surya.detection import DetectionPredictor
+    from surya.recognition import RecognitionPredictor
+    log.info("surya: loading recognition and detection models")
+    return RecognitionPredictor(), DetectionPredictor()
+
+def surya_predictions_to_text(predictions):
+    lines = []
+    for prediction in predictions or []:
+        text_lines = None
+        if isinstance(prediction, dict):
+            text_lines = prediction.get("text_lines") or prediction.get("lines")
+        else:
+            text_lines = getattr(prediction, "text_lines", None) or getattr(prediction, "lines", None)
+
+        if text_lines is None:
+            text = prediction.get("text") if isinstance(prediction, dict) else getattr(prediction, "text", None)
+            if text:
+                lines.append(str(text))
+            continue
+
+        for line in text_lines:
+            text = line.get("text") if isinstance(line, dict) else getattr(line, "text", None)
+            if text:
+                lines.append(str(text))
+    return "\n".join(lines)
+
 # ── Runners ───────────────────────────────────────────────────────────────────
 
 def run_pymupdf(path):
@@ -172,9 +242,8 @@ def run_pdfplumber(path):
 def run_paddleocr(path):
     import numpy as np
     from pdf2image import convert_from_path
-    from paddleocr import PaddleOCR
     log.info("paddleocr: loading model")
-    ocr   = PaddleOCR(use_textline_orientation=True, lang="en", device="cpu")
+    ocr   = load_paddleocr_model()
     pages = convert_from_path(path, dpi=200)
     log.info(f"paddleocr: running on {len(pages)} pages")
     text  = ""
@@ -205,6 +274,19 @@ def run_rapidocr(path):
         log.info(f"rapidocr: page {i}/{len(pages)} done")
     return text, 0
 
+def run_surya(path):
+    from pdf2image import convert_from_path
+    log.info("surya: starting")
+    recognition_predictor, detection_predictor = load_surya_models()
+    pages = convert_from_path(path, dpi=200)
+    log.info(f"surya: running on {len(pages)} pages")
+    text = ""
+    for i, page in enumerate(pages, 1):
+        predictions = recognition_predictor([page], det_predictor=detection_predictor)
+        text += surya_predictions_to_text(predictions) + "\n"
+        log.info(f"surya: page {i}/{len(pages)} done")
+    return text, 0
+
 def run_unstructured(path):
     from unstructured.partition.pdf import partition_pdf
     log.info("unstructured: partitioning")
@@ -233,13 +315,16 @@ def run_florence2(path):
     if not hasattr(transformers, "AutoModelForImageTextToText"):
         transformers.AutoModelForImageTextToText = AutoModelForVision2Seq
 
-    MODEL_ID = "microsoft/Florence-2-large"
+    MODEL_ID = "microsoft/Florence-2-base"
     device   = "cuda" if torch.cuda.is_available() else "cpu"
     dtype    = torch.float16 if device == "cuda" else torch.float32
     log.info(f"florence2: loading model on {device}")
-    processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
-    model     = AutoModelForCausalLM.from_pretrained(
-                    MODEL_ID, torch_dtype=dtype, trust_remote_code=True).to(device)
+    try:
+        processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
+        model     = AutoModelForCausalLM.from_pretrained(
+                        MODEL_ID, **florence_model_kwargs(dtype)).to(device)
+    except Exception as e:
+        raise RuntimeError(format_florence_error(e)) from e
     pages, text, prompt = convert_from_path(path, dpi=150), "", "<OCR>"
     for i, page in enumerate(pages, 1):
         inputs = processor(text=prompt, images=page, return_tensors="pt").to(device, dtype)
@@ -260,8 +345,7 @@ def ocr_images_with(library, images):
 
     if library == "paddleocr":
         import numpy as np
-        from paddleocr import PaddleOCR
-        ocr = PaddleOCR(use_textline_orientation=True, lang="en", device="cpu")
+        ocr = load_paddleocr_model()
         for i, img in enumerate(images, 1):
             result = list(ocr.predict(np.array(img)))
             if result:
@@ -282,6 +366,13 @@ def ocr_images_with(library, images):
                 text += " ".join([l[1] for l in result]) + "\n"
             log.info(f"Image OCR rapidocr: image {i}/{len(images)} done")
 
+    elif library == "surya":
+        recognition_predictor, detection_predictor = load_surya_models()
+        for i, img in enumerate(images, 1):
+            predictions = recognition_predictor([img], det_predictor=detection_predictor)
+            text += surya_predictions_to_text(predictions) + "\n"
+            log.info(f"Image OCR surya: image {i}/{len(images)} done")
+
     elif library == "florence2":
         import torch
         import transformers
@@ -293,9 +384,12 @@ def ocr_images_with(library, images):
         MODEL_ID = "microsoft/Florence-2-large"
         device   = "cuda" if torch.cuda.is_available() else "cpu"
         dtype    = torch.float16 if device == "cuda" else torch.float32
-        processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
-        model     = AutoModelForCausalLM.from_pretrained(
-                        MODEL_ID, torch_dtype=dtype, trust_remote_code=True).to(device)
+        try:
+            processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
+            model     = AutoModelForCausalLM.from_pretrained(
+                            MODEL_ID, **florence_model_kwargs(dtype)).to(device)
+        except Exception as e:
+            raise RuntimeError(format_florence_error(e)) from e
         prompt = "<OCR>"
         for i, img in enumerate(images, 1):
             inputs = processor(text=prompt, images=img, return_tensors="pt").to(device, dtype)
@@ -334,6 +428,7 @@ def ocr_images_with(library, images):
 runners = {
     "pymupdf": run_pymupdf, "pdfplumber": run_pdfplumber,
     "paddleocr": run_paddleocr, "rapidocr": run_rapidocr,
+    "surya": run_surya,
     "unstructured": run_unstructured, "docling": run_docling,
     "florence2": run_florence2,
 }

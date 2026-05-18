@@ -16,7 +16,7 @@ unstructured[pdf]
 rapidocr-onnxruntime
 paddleocr
 paddlepaddle
-# surya-ocr
+surya-ocr
 docling
 transformers
 timm
