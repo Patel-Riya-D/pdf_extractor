@@ -18,7 +18,7 @@ paddleocr
 paddlepaddle
 surya-ocr
 docling
-transformers
+transformers>=4.56.1,<5
 timm
 einops
 torch

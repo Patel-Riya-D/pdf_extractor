@@ -7,6 +7,7 @@ import streamlit as st
 import time, os, io, logging
 from pathlib import Path
 from importlib.util import find_spec
+from importlib.metadata import PackageNotFoundError, version
 from contextlib import redirect_stdout, redirect_stderr
 from shutil import which
 
@@ -40,7 +41,6 @@ LIBRARY_REQUIREMENTS = {
             ("numpy", "numpy"),
             ("pdf2image", "pdf2image"),
             ("paddleocr", "paddleocr"),
-            ("paddle", "paddlepaddle"),
         ],
         "system": [("pdftoppm", "poppler-utils")],
     },
@@ -96,6 +96,16 @@ def check_library_ready(library, image_ocr=False):
         if which("tesseract") is None:
             missing_sys.append("tesseract-ocr")
 
+    if library in ("surya", "docling", "florence2") and "transformers" not in missing_py:
+        try:
+            transformers_version = version("transformers")
+        except PackageNotFoundError:
+            missing_py.append("transformers>=4.56.1,<5")
+        else:
+            major = int(transformers_version.split(".", 1)[0])
+            if major >= 5:
+                missing_py.append("transformers>=4.56.1,<5")
+
     if missing_py or missing_sys:
         parts = []
         if missing_py:
@@ -124,6 +134,19 @@ def format_florence_error(exc):
         )
     return msg
 
+
+def ensure_transformers_legacy_symbols():
+    try:
+        import transformers.tokenization_utils as tokenization_utils
+        import transformers.tokenization_utils_base as tokenization_utils_base
+    except Exception:
+        return
+
+    if not hasattr(tokenization_utils, "TOKENIZER_CONFIG_FILE"):
+        tokenization_utils.TOKENIZER_CONFIG_FILE = getattr(
+            tokenization_utils_base, "TOKENIZER_CONFIG_FILE", "tokenizer_config.json"
+        )
+
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="PDF Extraction Benchmark", layout="wide", page_icon="📄")
 st.title("📄 PDF Extraction Benchmark")
@@ -148,7 +171,7 @@ pip install rapidocr-onnxruntime
 pip install surya-ocr
 pip install unstructured[pdf]
 pip install docling
-pip install transformers timm einops
+pip install "transformers>=4.56.1,<5" timm einops
 pip install streamlit pdf2image
 sudo apt install poppler-utils tesseract-ocr
 
@@ -174,26 +197,182 @@ def get_embedded_images(path):
     log.info(f"Extracted {len(imgs)} embedded images from PDF")
     return imgs
 
+
+# ── FIX: PaddleOCR — handle both old and new API styles ──────────────────────
 def load_paddleocr_model():
     from paddleocr import PaddleOCR
     for logger_name in ("paddle", "paddleocr", "paddlex", "ppocr"):
         logging.getLogger(logger_name).setLevel(logging.ERROR)
-    kwargs = {
-        "use_doc_orientation_classify": False,
-        "use_doc_unwarping": False,
-        "use_textline_orientation": False,
-        "enable_mkldnn": False,
-        "lang": "en",
-        "device": "cpu",
-    }
-    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-        return PaddleOCR(**kwargs)
 
+    constructor_options = [
+        {
+            "use_doc_orientation_classify": False,
+            "use_doc_unwarping": False,
+            "use_textline_orientation": False,
+            "lang": "en",
+        },
+        {
+            "use_angle_cls": True,
+            "lang": "en",
+            "enable_mkldnn": False,
+        },
+        {"lang": "en"},
+        {},
+    ]
+
+    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+        last_error = None
+        for kwargs in constructor_options:
+            try:
+                model = PaddleOCR(**kwargs)
+                if not (hasattr(model, "predict") or hasattr(model, "ocr")):
+                    raise AttributeError("PaddleOCR model has no predict() or ocr() method")
+                return model
+            except Exception as e:
+                last_error = e
+        raise RuntimeError(f"Could not initialize PaddleOCR: {last_error}") from last_error
+
+
+def paddleocr_run(ocr, image_array):
+    """
+    Unified call for both old PaddleOCR (ocr()) and new PaddleOCR (predict()).
+    Returns a flat list of text strings.
+    """
+    import numpy as np
+    texts = []
+
+    # --- new API: predict() ---
+    if hasattr(ocr, "predict"):
+        try:
+            result = list(ocr.predict(image_array))
+            for r in result:
+                if r is None:
+                    continue
+                if isinstance(r, dict):
+                    chunk = r.get("rec_texts") or r.get("txts") or []
+                    texts.extend([t for t in chunk if t])
+                elif hasattr(r, "rec_texts") and r.rec_texts:
+                    texts.extend([t for t in r.rec_texts if t])
+                elif hasattr(r, "txts") and r.txts:
+                    texts.extend([t for t in r.txts if t])
+                elif isinstance(r, list):
+                    for line in r:
+                        if line and len(line) >= 2:
+                            t = line[1]
+                            if isinstance(t, (list, tuple)):
+                                texts.append(str(t[0]))
+                            else:
+                                texts.append(str(t))
+            return texts
+        except Exception as e:
+            log.warning(f"paddleocr predict() failed: {e}, falling back to ocr()")
+
+    # --- old API: ocr() ---
+    if hasattr(ocr, "ocr"):
+        try:
+            result = ocr.ocr(image_array, cls=True)
+            if result:
+                for page_result in result:
+                    if not page_result:
+                        continue
+                    for line in page_result:
+                        if line and len(line) >= 2:
+                            t = line[1]
+                            if isinstance(t, (list, tuple)):
+                                texts.append(str(t[0]))
+                            else:
+                                texts.append(str(t))
+            return texts
+        except Exception as e:
+            log.warning(f"paddleocr ocr() failed: {e}")
+
+    return texts
+
+
+# ── FIX: Surya — patch tie_weights and rope init for newer transformers ────────
 def load_surya_models():
+    # Patch transformers SuryaModel.tie_weights to accept **kwargs
+    # This fixes: "tie_weights() got an unexpected keyword argument 'missing_keys'"
+    try:
+        from surya.common.surya import SuryaModel
+        if hasattr(SuryaModel, "tie_weights"):
+            original_tie = SuryaModel.tie_weights
+            def patched_tie_weights(self, *args, **kwargs):
+                try:
+                    return original_tie(self, *args, **kwargs)
+                except TypeError:
+                    # Strip unexpected kwargs and retry
+                    return original_tie(self)
+            SuryaModel.tie_weights = patched_tie_weights
+            log.info("surya: patched SuryaModel.tie_weights")
+    except ImportError:
+        pass
+
+    # Patch all_tied_weights_keys if missing
+    try:
+        from surya.common.surya import SuryaModel
+        if not hasattr(SuryaModel, "all_tied_weights_keys"):
+            SuryaModel.all_tied_weights_keys = {}
+    except ImportError:
+        pass
+
+    # Patch ROPE init functions
+    try:
+        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+        if "default" not in ROPE_INIT_FUNCTIONS:
+            def default_rope_parameters(config=None, device=None, seq_len=None, **kwargs):
+                import torch
+                base = getattr(config, "rope_theta", 10000.0)
+                head_dim = getattr(config, "head_dim", None)
+                if head_dim is None:
+                    head_dim = config.hidden_size // config.num_attention_heads
+                inv_freq = 1.0 / (
+                    base ** (
+                        torch.arange(0, head_dim, 2, dtype=torch.int64, device=device).float()
+                        / head_dim
+                    )
+                )
+                return inv_freq, 1.0
+            ROPE_INIT_FUNCTIONS["default"] = default_rope_parameters
+    except (ImportError, Exception):
+        pass
+
+    # Patch SuryaDecoderConfig token IDs
+    try:
+        from surya.common.surya.decoder.config import SuryaDecoderConfig
+        if not getattr(SuryaDecoderConfig, "_pdf_bench_patched", False):
+            original_init = SuryaDecoderConfig.__init__
+            def patched_init(self, *args, **kwargs):
+                original_init(self, *args, **kwargs)
+                if getattr(self, "pad_token_id", None) is None:
+                    self.pad_token_id = 2
+                if getattr(self, "bos_token_id", None) is None:
+                    self.bos_token_id = 0
+                if getattr(self, "eos_token_id", None) is None:
+                    self.eos_token_id = 1
+            SuryaDecoderConfig.__init__ = patched_init
+            SuryaDecoderConfig._pdf_bench_patched = True
+    except (ImportError, Exception):
+        pass
+
     from surya.detection import DetectionPredictor
     from surya.recognition import RecognitionPredictor
+
+    try:
+        from surya.foundation import FoundationPredictor
+    except ImportError:
+        FoundationPredictor = None
+
     log.info("surya: loading recognition and detection models")
-    return RecognitionPredictor(), DetectionPredictor()
+    detection_predictor = DetectionPredictor()
+
+    if FoundationPredictor is None:
+        recognition_predictor = RecognitionPredictor()
+    else:
+        recognition_predictor = RecognitionPredictor(FoundationPredictor())
+
+    return recognition_predictor, detection_predictor
+
 
 def surya_predictions_to_text(predictions):
     lines = []
@@ -215,6 +394,88 @@ def surya_predictions_to_text(predictions):
             if text:
                 lines.append(str(text))
     return "\n".join(lines)
+
+
+# ── FIX: Docling — handle API changes across versions ─────────────────────────
+def run_docling_safe(path):
+    ensure_transformers_legacy_symbols()
+    from docling.document_converter import DocumentConverter
+    log.info("docling: converting")
+    result = DocumentConverter().convert(path)
+    doc = result.document
+    text = ""
+
+    # Try markdown export first
+    try:
+        text = doc.export_to_markdown()
+    except Exception:
+        pass
+
+    # Fallback: export to text
+    if not text:
+        try:
+            text = doc.export_to_text()
+        except Exception:
+            pass
+
+    # Fallback: iterate texts manually
+    if not text:
+        try:
+            parts = []
+            if hasattr(doc, "texts"):
+                for t in doc.texts:
+                    val = getattr(t, "text", None) or (t.get("text") if isinstance(t, dict) else None)
+                    if val:
+                        parts.append(str(val))
+            text = "\n".join(parts)
+        except Exception:
+            pass
+
+    # Count pictures/images
+    n_imgs = 0
+    try:
+        # New API: iterate_items
+        n_imgs = len([i for i, _ in doc.iterate_items() if "Picture" in type(i).__name__])
+    except Exception:
+        try:
+            if hasattr(doc, "pictures"):
+                n_imgs = len(doc.pictures)
+        except Exception:
+            n_imgs = 0
+
+    log.info(f"docling: done — {len(text)} chars, {n_imgs} pictures")
+    return text, n_imgs
+
+
+# ── FIX: Florence2 — robust model loading with multiple fallbacks ─────────────
+def load_florence2_model(model_id, dtype, device):
+    ensure_transformers_legacy_symbols()
+    import transformers
+    from transformers import AutoProcessor
+
+    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+
+    # Try in order: AutoModelForCausalLM, AutoModelForVision2Seq, AutoModelForImageTextToText
+    model = None
+    errors = []
+
+    for cls_name in ["AutoModelForCausalLM", "AutoModelForVision2Seq", "AutoModelForImageTextToText"]:
+        cls = getattr(transformers, cls_name, None)
+        if cls is None:
+            continue
+        try:
+            model = cls.from_pretrained(model_id, **florence_model_kwargs(dtype)).to(device)
+            log.info(f"florence2: loaded with {cls_name}")
+            break
+        except Exception as e:
+            errors.append(f"{cls_name}: {e}")
+            continue
+
+    if model is None:
+        raise RuntimeError("Florence2 model load failed. Errors: " + " | ".join(errors))
+
+    return processor, model
+
 
 # ── Runners ───────────────────────────────────────────────────────────────────
 
@@ -248,14 +509,8 @@ def run_paddleocr(path):
     log.info(f"paddleocr: running on {len(pages)} pages")
     text  = ""
     for i, page in enumerate(pages, 1):
-        result = list(ocr.predict(np.array(page)))
-        if result:
-            r = result[0]
-            if isinstance(r, dict):   texts = r.get("rec_texts") or r.get("txts") or []
-            elif hasattr(r,"rec_texts"): texts = r.rec_texts or []
-            elif hasattr(r,"txts"):   texts = r.txts or []
-            else: texts = [l[1][0] for l in (r or []) if l]
-            text += " ".join(texts) + "\n"
+        texts = paddleocr_run(ocr, np.array(page))
+        text += " ".join(texts) + "\n"
         log.info(f"paddleocr: page {i}/{len(pages)} done")
     return text, 0
 
@@ -297,43 +552,42 @@ def run_unstructured(path):
     return text, n_imgs
 
 def run_docling(path):
-    from docling.document_converter import DocumentConverter
-    log.info("docling: converting")
-    result = DocumentConverter().convert(path)
-    doc    = result.document
-    text   = doc.export_to_markdown()
-    n_imgs = len([i for i, _ in doc.iterate_items() if "Picture" in type(i).__name__])
-    log.info(f"docling: done — {len(text)} chars, {n_imgs} pictures")
-    return text, n_imgs
+    return run_docling_safe(path)
 
 def run_florence2(path):
     import torch
-    import transformers
-    from transformers import AutoModelForCausalLM, AutoModelForVision2Seq, AutoProcessor
     from pdf2image import convert_from_path
-
-    if not hasattr(transformers, "AutoModelForImageTextToText"):
-        transformers.AutoModelForImageTextToText = AutoModelForVision2Seq
 
     MODEL_ID = "microsoft/Florence-2-base"
     device   = "cuda" if torch.cuda.is_available() else "cpu"
     dtype    = torch.float16 if device == "cuda" else torch.float32
     log.info(f"florence2: loading model on {device}")
+
     try:
-        processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
-        model     = AutoModelForCausalLM.from_pretrained(
-                        MODEL_ID, **florence_model_kwargs(dtype)).to(device)
+        processor, model = load_florence2_model(MODEL_ID, dtype, device)
     except Exception as e:
         raise RuntimeError(format_florence_error(e)) from e
+
     pages, text, prompt = convert_from_path(path, dpi=150), "", "<OCR>"
     for i, page in enumerate(pages, 1):
-        inputs = processor(text=prompt, images=page, return_tensors="pt").to(device, dtype)
-        ids    = model.generate(input_ids=inputs["input_ids"],
-                                pixel_values=inputs["pixel_values"],
-                                max_new_tokens=1024, num_beams=3)
-        out    = processor.batch_decode(ids, skip_special_tokens=False)[0]
-        text  += processor.post_process_generation(
-                    out, task=prompt, image_size=page.size)[prompt] + "\n"
+        try:
+            inputs = processor(text=prompt, images=page, return_tensors="pt").to(device, dtype)
+            ids    = model.generate(
+                input_ids=inputs["input_ids"],
+                pixel_values=inputs["pixel_values"],
+                max_new_tokens=1024,
+                num_beams=3,
+            )
+            out   = processor.batch_decode(ids, skip_special_tokens=False)[0]
+            page_text = processor.post_process_generation(
+                out, task=prompt, image_size=page.size
+            )
+            if isinstance(page_text, dict):
+                text += page_text.get(prompt, str(page_text)) + "\n"
+            else:
+                text += str(page_text) + "\n"
+        except Exception as e:
+            log.warning(f"florence2: page {i} error: {e}")
         log.info(f"florence2: page {i}/{len(pages)} done")
     return text, 0
 
@@ -347,13 +601,8 @@ def ocr_images_with(library, images):
         import numpy as np
         ocr = load_paddleocr_model()
         for i, img in enumerate(images, 1):
-            result = list(ocr.predict(np.array(img)))
-            if result:
-                r = result[0]
-                if isinstance(r, dict):      ts = r.get("rec_texts") or []
-                elif hasattr(r,"rec_texts"): ts = r.rec_texts or []
-                else:                        ts = []
-                text += " ".join(ts) + "\n"
+            texts = paddleocr_run(ocr, np.array(img))
+            text += " ".join(texts) + "\n"
             log.info(f"Image OCR paddleocr: image {i}/{len(images)} done")
 
     elif library == "rapidocr":
@@ -375,30 +624,33 @@ def ocr_images_with(library, images):
 
     elif library == "florence2":
         import torch
-        import transformers
-        from transformers import AutoModelForCausalLM, AutoModelForVision2Seq, AutoProcessor
-
-        if not hasattr(transformers, "AutoModelForImageTextToText"):
-            transformers.AutoModelForImageTextToText = AutoModelForVision2Seq
-
         MODEL_ID = "microsoft/Florence-2-large"
         device   = "cuda" if torch.cuda.is_available() else "cpu"
         dtype    = torch.float16 if device == "cuda" else torch.float32
         try:
-            processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
-            model     = AutoModelForCausalLM.from_pretrained(
-                            MODEL_ID, **florence_model_kwargs(dtype)).to(device)
+            processor, model = load_florence2_model(MODEL_ID, dtype, device)
         except Exception as e:
             raise RuntimeError(format_florence_error(e)) from e
         prompt = "<OCR>"
         for i, img in enumerate(images, 1):
-            inputs = processor(text=prompt, images=img, return_tensors="pt").to(device, dtype)
-            ids    = model.generate(input_ids=inputs["input_ids"],
-                                    pixel_values=inputs["pixel_values"],
-                                    max_new_tokens=512, num_beams=3)
-            out    = processor.batch_decode(ids, skip_special_tokens=False)[0]
-            text  += processor.post_process_generation(
-                        out, task=prompt, image_size=img.size)[prompt] + "\n"
+            try:
+                inputs = processor(text=prompt, images=img, return_tensors="pt").to(device, dtype)
+                ids    = model.generate(
+                    input_ids=inputs["input_ids"],
+                    pixel_values=inputs["pixel_values"],
+                    max_new_tokens=512,
+                    num_beams=3,
+                )
+                out   = processor.batch_decode(ids, skip_special_tokens=False)[0]
+                page_text = processor.post_process_generation(
+                    out, task=prompt, image_size=img.size
+                )
+                if isinstance(page_text, dict):
+                    text += page_text.get(prompt, str(page_text)) + "\n"
+                else:
+                    text += str(page_text) + "\n"
+            except Exception as e:
+                log.warning(f"Image OCR florence2: image {i} error: {e}")
             log.info(f"Image OCR florence2: image {i}/{len(images)} done")
 
     elif library == "unstructured":
